@@ -1,0 +1,305 @@
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import requests
+
+MC_DIR = Path("./minecraft").resolve()
+MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
+VERSION = "1.8.9"
+
+OS_NAME = {"Windows": "windows", "Linux": "linux", "Darwin": "osx"}[platform.system()]
+ARCH = "x64" if platform.machine() in ("AMD64", "x86_64") else "x86"
+
+
+# ============ СКАЧИВАНИЕ ============
+
+def download(url, dest: Path, sha1=None, retries=3):
+    """Скачивает файл с проверкой статуса, Content-Type и SHA1."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Пропускаем, если файл уже есть и валиден
+    if dest.exists() and dest.stat().st_size > 10:
+        if sha1 is None:
+            return
+        if hashlib.sha1(dest.read_bytes()).hexdigest() == sha1:
+            return
+        dest.unlink()
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, stream=True, timeout=30)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code} для {url}")
+
+            ctype = r.headers.get("Content-Type", "").lower()
+            if "html" in ctype:
+                raise RuntimeError(f"HTML вместо данных: {url}")
+
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+
+            if dest.stat().st_size < 10:
+                dest.unlink()
+                raise RuntimeError(f"Пустой файл: {url}")
+
+            if sha1:
+                actual = hashlib.sha1(dest.read_bytes()).hexdigest()
+                if actual != sha1:
+                    dest.unlink()
+                    raise RuntimeError(f"SHA1 mismatch: {dest.name}")
+
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1 + attempt)
+
+    raise last_err
+
+
+def should_download(lib):
+    """Проверка rules — нужна ли библиотека для нашей ОС."""
+    rules = lib.get("rules")
+    if not rules:
+        return True
+    allowed = False
+    for rule in rules:
+        rule_os = rule.get("os", {}).get("name")
+        if rule_os is None or rule_os == OS_NAME:
+            allowed = (rule["action"] == "allow")
+    return allowed
+
+
+# ============ УСТАНОВКА ============
+
+def get_version_json():
+    print(f"Ищем версию {VERSION}...")
+    manifest = requests.get(MANIFEST_URL, timeout=30).json()
+    meta = next(v for v in manifest["versions"] if v["id"] == VERSION)
+    ver_json = requests.get(meta["url"], timeout=30).json()
+    return meta, ver_json
+
+
+def install_version(meta, ver_json):
+    vid = meta["id"]
+    ver_dir = MC_DIR / "versions" / vid
+    ver_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON версии
+    json_path = ver_dir / f"{vid}.json"
+    if not json_path.exists():
+        json_path.write_text(json.dumps(ver_json, indent=2), encoding="utf-8")
+
+    # Клиент
+    client = ver_json["downloads"]["client"]
+    download(client["url"], ver_dir / f"{vid}.jar", client["sha1"])
+
+    # Библиотеки
+    print("Скачиваем библиотеки...")
+    for lib in ver_json.get("libraries", []):
+        if not should_download(lib):
+            continue
+        art = lib.get("downloads", {}).get("artifact")
+        if art:
+            download(art["url"], MC_DIR / "libraries" / art["path"], art.get("sha1"))
+
+    # Ассеты (индекс)
+    print("Скачиваем индекс ассетов...")
+    idx = ver_json["assetIndex"]
+    idx_path = MC_DIR / "assets" / "indexes" / f"{idx['id']}.json"
+    download(idx["url"], idx_path, idx["sha1"])
+
+    # Ассеты (файлы) — параллельно
+    print("Скачиваем ассеты (параллельно)...")
+    assets = json.loads(idx_path.read_text(encoding="utf-8"))
+
+    def fetch(obj):
+        h = obj["hash"]
+        download(
+            f"https://resources.download.minecraft.net/{h[:2]}/{h}",
+            MC_DIR / "assets" / "objects" / h[:2] / h,
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        list(pool.map(fetch, assets["objects"].values()))
+
+    # Нативы
+    print("Распаковываем нативы...")
+    natives_dir = MC_DIR / "natives"
+    if natives_dir.exists():
+        for f in natives_dir.iterdir():
+            f.unlink()
+    natives_dir.mkdir(exist_ok=True)
+
+    for lib in ver_json.get("libraries", []):
+        if not should_download(lib):
+            continue
+        classifiers = lib.get("downloads", {}).get("classifiers", {})
+        for key, cls in classifiers.items():
+            if "natives" not in key:
+                continue
+            # Проверяем по правилам библиотеки (для LWJGL важно)
+            if not should_download(lib):
+                continue
+            # Проверяем, что натив подходит под нашу ОС
+            if key.endswith("-" + OS_NAME) or f"-{OS_NAME}-" in key:
+                jar_path = MC_DIR / "libraries" / cls["path"]
+                if not jar_path.exists():
+                    download(cls["url"], jar_path, cls.get("sha1"))
+                with zipfile.ZipFile(jar_path) as z:
+                    for name in z.namelist():
+                        if name.endswith((".dll", ".so", ".dylib", ".jnilib")):
+                            (natives_dir / Path(name).name).write_bytes(z.read(name))
+
+    print(f"✅ Версия {vid} установлена")
+
+
+# ============ JAVA ============
+
+def ensure_java(major=8):
+    java_root = MC_DIR / "runtime" / f"java{major}"
+
+    # Ищем уже скачанную Java
+    for exe in java_root.rglob("java.exe" if OS_NAME == "windows" else "java"):
+        if exe.is_file():
+            return str(exe)
+
+    print(f"Скачиваем Java {major}...")
+    java_root.mkdir(parents=True, exist_ok=True)
+    ext = "zip" if OS_NAME == "windows" else "tar.gz"
+    url = (
+        f"https://api.adoptium.net/v3/binary/latest/{major}/ga/"
+        f"{OS_NAME}/{ARCH}/jre/hotspot/normal/eclipse"
+    )
+    archive = java_root / f"java.{ext}"
+    download(url, archive)
+
+    print("Распаковка Java...")
+    if ext == "zip":
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(java_root)
+    else:
+        with tarfile.open(archive) as t:
+            t.extractall(java_root)
+    archive.unlink()
+
+    for exe in java_root.rglob("java.exe" if OS_NAME == "windows" else "java"):
+        if exe.is_file():
+            return str(exe)
+    raise RuntimeError("Java не найдена после распаковки")
+
+
+# ============ ЗАПУСК ============
+
+def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
+    ver_dir = MC_DIR / "versions" / vid
+
+    # Classpath
+    cp = [str(ver_dir / f"{vid}.jar")]
+    for lib in ver_json.get("libraries", []):
+        if not should_download(lib):
+            continue
+        art = lib.get("downloads", {}).get("artifact")
+        if art:
+            cp.append(str(MC_DIR / "libraries" / art["path"]))
+    classpath = os.pathsep.join(cp)
+
+    # Плейсхолдеры
+    repl = {
+        "${auth_player_name}": username,
+        "${version_name}": vid,
+        "${game_directory}": str(MC_DIR),
+        "${assets_root}": str(MC_DIR / "assets"),
+        "${assets_index_name}": ver_json["assetIndex"]["id"],
+        "${auth_uuid}": "00000000000000000000000000000000",
+        "${auth_access_token}": "0",
+        "${auth_session}": "0",
+        "${user_type}": "legacy",
+        "${version_type}": ver_json.get("type", "release"),
+        "${natives_directory}": str(MC_DIR / "natives"),
+        "${classpath}": classpath,
+        "${launcher_name}": "MyLauncher",
+        "${launcher_version}": "1.0",
+        "${user_properties}": "{}",  # <-- ГЛАВНЫЙ ФИКС
+    }
+
+    def sub(s):
+        for k, v in repl.items():
+            s = s.replace(k, v)
+        return s
+
+    # Аргументы
+    if "arguments" in ver_json:
+        # Новый формат (1.13+)
+        jvm_args = [f"-Xmx{ram_mb}M"]
+        game_args = []
+        for a in ver_json["arguments"].get("jvm", []):
+            if isinstance(a, str):
+                jvm_args.append(sub(a))
+            elif isinstance(a, dict) and should_download(a):
+                jvm_args.extend(sub(x) for x in a["value"])
+        for a in ver_json["arguments"].get("game", []):
+            if isinstance(a, str):
+                game_args.append(sub(a))
+            elif isinstance(a, dict) and should_download(a):
+                game_args.extend(sub(x) for x in a["value"])
+    else:
+        # Старый формат (1.8.9 и старше)
+        jvm_args = [
+            f"-Xmx{ram_mb}M",
+            f"-Djava.library.path={repl['${natives_directory}']}",
+        ]
+        game_args = [sub(a) for a in ver_json["minecraftArguments"].split()]
+
+    main_class = ver_json["mainClass"]
+    cmd = [java_path] + jvm_args + ["-cp", classpath, main_class] + game_args
+
+    # Проверка на неподставленные плейсхолдеры
+    print("\n=== АРГУМЕНТЫ ЗАПУСКА ===")
+    bad = False
+    for i, a in enumerate(cmd):
+        marker = " ⚠️ НЕПОДСТАВЛЕН!" if "${" in a else ""
+        if marker:
+            bad = True
+        print(f"{i:3}: {a!r}{marker}")
+    if bad:
+        raise RuntimeError("Остались неподставленные плейсхолдеры ${...}!")
+
+    print(f"\n🚀 Запуск Minecraft {vid}...")
+    subprocess.run(cmd, cwd=MC_DIR)
+
+
+# ============ MAIN ============
+
+def main():
+    MC_DIR.mkdir(exist_ok=True)
+
+    meta, ver_json = get_version_json()
+    size_mb = ver_json["downloads"]["client"]["size"] / 1024 / 1024
+    print(f"✅ Найдено: {meta['id']} ({size_mb:.1f} MB)")
+
+    install_version(meta, ver_json)
+
+    java_path = ensure_java(major=8)
+    print(f"✅ Java: {java_path}")
+
+    launch(meta["id"], ver_json, java_path, username="Player", ram_mb=2048)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Ошибка: {e}", file=sys.stderr)
+        raise
