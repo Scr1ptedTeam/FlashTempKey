@@ -11,6 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
+import urllib3
+
+# Отключаем предупреждения о небезопасном SSL для школьных сетей
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 MC_DIR = Path("./minecraft").resolve()
 MANIFEST_URL = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
@@ -37,7 +41,8 @@ def download(url, dest: Path, sha1=None, retries=3):
     last_err = None
     for attempt in range(retries):
         try:
-            r = requests.get(url, stream=True, timeout=30)
+            # ДОБАВЛЕНО: verify=False для обхода школьного SSL
+            r = requests.get(url, stream=True, timeout=30, verify=False)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code} для {url}")
 
@@ -85,9 +90,11 @@ def should_download(lib):
 
 def get_version_json():
     print(f"Ищем версию {VERSION}...")
-    manifest = requests.get(MANIFEST_URL, timeout=30).json()
+    # ДОБАВЛЕНО: verify=False
+    manifest = requests.get(MANIFEST_URL, timeout=30, verify=False).json()
     meta = next(v for v in manifest["versions"] if v["id"] == VERSION)
-    ver_json = requests.get(meta["url"], timeout=30).json()
+    # ДОБАВЛЕНО: verify=False
+    ver_json = requests.get(meta["url"], timeout=30, verify=False).json()
     return meta, ver_json
 
 
@@ -149,10 +156,8 @@ def install_version(meta, ver_json):
         for key, cls in classifiers.items():
             if "natives" not in key:
                 continue
-            # Проверяем по правилам библиотеки (для LWJGL важно)
             if not should_download(lib):
                 continue
-            # Проверяем, что натив подходит под нашу ОС
             if key.endswith("-" + OS_NAME) or f"-{OS_NAME}-" in key:
                 jar_path = MC_DIR / "libraries" / cls["path"]
                 if not jar_path.exists():
@@ -231,7 +236,7 @@ def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
         "${classpath}": classpath,
         "${launcher_name}": "MyLauncher",
         "${launcher_version}": "1.0",
-        "${user_properties}": "{}",  # <-- ГЛАВНЫЙ ФИКС
+        "${user_properties}": "{}",
     }
 
     def sub(s):
