@@ -24,13 +24,42 @@ OS_NAME = {"Windows": "windows", "Linux": "linux", "Darwin": "osx"}[platform.sys
 ARCH = "x64" if platform.machine() in ("AMD64", "x86_64") else "x86"
 
 
+# ============ БЕЗОПАСНЫЙ ЗАПРОС ============
+
+def safe_get_json(url):
+    """Безопасно скачивает JSON. Если пришел не JSON — выдает понятную ошибку."""
+    print(f"  ⏳ Запрос: {url}")
+    try:
+        r = requests.get(url, timeout=30, verify=False)
+        
+        # Проверяем, не заблокировал ли прокси запрос
+        if r.status_code != 200:
+            raise RuntimeError(f"Сервер вернул код {r.status_code}. Возможно, доступ заблокирован.")
+            
+        # Пытаемся распарсить
+        try:
+            return r.json()
+        except requests.exceptions.JSONDecodeError:
+            # Если это не JSON, сохраняем ответ, чтобы посмотреть, что там
+            debug_file = Path("error_response.html")
+            debug_file.write_text(r.text, encoding="utf-8")
+            
+            snippet = r.text[:150].replace('\n', ' ')
+            raise RuntimeError(
+                f"Сервер вернул не JSON, а что-то другое!\n"
+                f"Начало ответа: {snippet}...\n"
+                f"Полный ответ сохранен в файл: {debug_file.absolute()}"
+            )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Ошибка сети: {e}")
+
+
 # ============ СКАЧИВАНИЕ ============
 
 def download(url, dest: Path, sha1=None, retries=3):
     """Скачивает файл с проверкой статуса, Content-Type и SHA1."""
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    # Пропускаем, если файл уже есть и валиден
     if dest.exists() and dest.stat().st_size > 10:
         if sha1 is None:
             return
@@ -41,7 +70,6 @@ def download(url, dest: Path, sha1=None, retries=3):
     last_err = None
     for attempt in range(retries):
         try:
-            # ДОБАВЛЕНО: verify=False для обхода школьного SSL
             r = requests.get(url, stream=True, timeout=30, verify=False)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code} для {url}")
@@ -74,7 +102,6 @@ def download(url, dest: Path, sha1=None, retries=3):
 
 
 def should_download(lib):
-    """Проверка rules — нужна ли библиотека для нашей ОС."""
     rules = lib.get("rules")
     if not rules:
         return True
@@ -90,11 +117,15 @@ def should_download(lib):
 
 def get_version_json():
     print(f"Ищем версию {VERSION}...")
-    # ДОБАВЛЕНО: verify=False
-    manifest = requests.get(MANIFEST_URL, timeout=30, verify=False).json()
-    meta = next(v for v in manifest["versions"] if v["id"] == VERSION)
-    # ДОБАВЛЕНО: verify=False
-    ver_json = requests.get(meta["url"], timeout=30, verify=False).json()
+    
+    # ТЕПЕРЬ ИСПОЛЬЗУЕМ БЕЗОПАСНЫЙ ЗАПРОС
+    manifest = safe_get_json(MANIFEST_URL)
+    
+    meta = next((v for v in manifest["versions"] if v["id"] == VERSION), None)
+    if not meta:
+        raise RuntimeError(f"Версия {VERSION} не найдена в манифесте Mojang!")
+        
+    ver_json = safe_get_json(meta["url"])
     return meta, ver_json
 
 
@@ -103,16 +134,13 @@ def install_version(meta, ver_json):
     ver_dir = MC_DIR / "versions" / vid
     ver_dir.mkdir(parents=True, exist_ok=True)
 
-    # JSON версии
     json_path = ver_dir / f"{vid}.json"
     if not json_path.exists():
         json_path.write_text(json.dumps(ver_json, indent=2), encoding="utf-8")
 
-    # Клиент
     client = ver_json["downloads"]["client"]
     download(client["url"], ver_dir / f"{vid}.jar", client["sha1"])
 
-    # Библиотеки
     print("Скачиваем библиотеки...")
     for lib in ver_json.get("libraries", []):
         if not should_download(lib):
@@ -121,13 +149,11 @@ def install_version(meta, ver_json):
         if art:
             download(art["url"], MC_DIR / "libraries" / art["path"], art.get("sha1"))
 
-    # Ассеты (индекс)
     print("Скачиваем индекс ассетов...")
     idx = ver_json["assetIndex"]
     idx_path = MC_DIR / "assets" / "indexes" / f"{idx['id']}.json"
     download(idx["url"], idx_path, idx["sha1"])
 
-    # Ассеты (файлы) — параллельно
     print("Скачиваем ассеты (параллельно)...")
     assets = json.loads(idx_path.read_text(encoding="utf-8"))
 
@@ -141,7 +167,6 @@ def install_version(meta, ver_json):
     with ThreadPoolExecutor(max_workers=32) as pool:
         list(pool.map(fetch, assets["objects"].values()))
 
-    # Нативы
     print("Распаковываем нативы...")
     natives_dir = MC_DIR / "natives"
     if natives_dir.exists():
@@ -155,8 +180,6 @@ def install_version(meta, ver_json):
         classifiers = lib.get("downloads", {}).get("classifiers", {})
         for key, cls in classifiers.items():
             if "natives" not in key:
-                continue
-            if not should_download(lib):
                 continue
             if key.endswith("-" + OS_NAME) or f"-{OS_NAME}-" in key:
                 jar_path = MC_DIR / "libraries" / cls["path"]
@@ -174,8 +197,6 @@ def install_version(meta, ver_json):
 
 def ensure_java(major=8):
     java_root = MC_DIR / "runtime" / f"java{major}"
-
-    # Ищем уже скачанную Java
     for exe in java_root.rglob("java.exe" if OS_NAME == "windows" else "java"):
         if exe.is_file():
             return str(exe)
@@ -209,8 +230,6 @@ def ensure_java(major=8):
 
 def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
     ver_dir = MC_DIR / "versions" / vid
-
-    # Classpath
     cp = [str(ver_dir / f"{vid}.jar")]
     for lib in ver_json.get("libraries", []):
         if not should_download(lib):
@@ -220,7 +239,6 @@ def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
             cp.append(str(MC_DIR / "libraries" / art["path"]))
     classpath = os.pathsep.join(cp)
 
-    # Плейсхолдеры
     repl = {
         "${auth_player_name}": username,
         "${version_name}": vid,
@@ -244,9 +262,7 @@ def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
             s = s.replace(k, v)
         return s
 
-    # Аргументы
     if "arguments" in ver_json:
-        # Новый формат (1.13+)
         jvm_args = [f"-Xmx{ram_mb}M"]
         game_args = []
         for a in ver_json["arguments"].get("jvm", []):
@@ -260,7 +276,6 @@ def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
             elif isinstance(a, dict) and should_download(a):
                 game_args.extend(sub(x) for x in a["value"])
     else:
-        # Старый формат (1.8.9 и старше)
         jvm_args = [
             f"-Xmx{ram_mb}M",
             f"-Djava.library.path={repl['${natives_directory}']}",
@@ -270,7 +285,6 @@ def launch(vid, ver_json, java_path, username="Player", ram_mb=2048):
     main_class = ver_json["mainClass"]
     cmd = [java_path] + jvm_args + ["-cp", classpath, main_class] + game_args
 
-    # Проверка на неподставленные плейсхолдеры
     print("\n=== АРГУМЕНТЫ ЗАПУСКА ===")
     bad = False
     for i, a in enumerate(cmd):
@@ -307,4 +321,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"\n❌ Ошибка: {e}", file=sys.stderr)
-        raise
+        # Если произошла ошибка, скрипт не закроется сразу, чтобы ты успел прочитать
+        input("\nНажми Enter, чтобы закрыть...")
